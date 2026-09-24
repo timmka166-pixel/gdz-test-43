@@ -217,7 +217,8 @@ body{
 </div>
 
 <script type="module">
-import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+import * as webllm from "https://esm.run/@mlc-ai/web-llm@0.2.84";
+import { pipeline, TextStreamer } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.7.2/+esm";
 
 marked.setOptions({breaks:true});
 const el = id => document.getElementById(id);
@@ -241,6 +242,8 @@ applyTheme(); applySize();
 let chats = store.chats;
 let currentId = null;
 let engine = null;
+let localPipeline = null;
+let backendMode = "webllm";
 let generating = false;
 let abortRequested = false;
 let currentAssistantBubble = null;
@@ -267,21 +270,24 @@ function findModels(){
 }
 
 /* ---------- boot / model loading ---------- */
+async function getGpuLimits(){
+  try{
+    if(!navigator.gpu) return null;
+    const adapter = await navigator.gpu.requestAdapter({powerPreference:'high-performance'});
+    if(!adapter) return null;
+    return {
+      maxComputeWorkgroupStorageSize: adapter.limits.maxComputeWorkgroupStorageSize,
+      maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+      maxBufferSize: adapter.limits.maxBufferSize
+    };
+  }catch(e){ return null; }
+}
+
 async function boot(){
-  if(!window.isSecureContext){
-    el('bootBody').innerHTML = `
-      <div class="error-box">SPOOX нужен безопасный контекст для WebGPU. Откройте сайт через <b>HTTPS</b> или на localhost. Не запускайте его как обычный внешний HTTP-сайт без HTTPS.</div>`;
-    return;
-  }
+  const limits = await getGpuLimits();
   if(!navigator.gpu){
-    el('bootBody').innerHTML = `
-      <div class="error-box">
-        В этом браузере нет WebGPU, поэтому запустить локальную модель невозможно —
-        SPOOX AI не может подменить это фейковой имитацией AI.<br><br>
-        На Android откройте страницу в актуальном браузере с поддержкой WebGPU. Если WebGPU недоступен, сайт честно сообщит об этом.
-        Полноценный WASM-фоллбэк для LLM такого класса в браузере практически непригоден по скорости,
-        поэтому мы его не подставляем вместо настоящей модели.
-      </div>`;
+    el('bootBody').innerHTML = `<div class="error-box">В этом браузере нет WebGPU. Попробуем запасной локальный режим через CPU/WASM — он медленнее, но работает без API-ключа.</div><button class="btn" style="margin-top:14px;max-width:260px" id="cpuStartBtn">Запустить локальный CPU-режим</button>`;
+    el('cpuStartBtn').onclick = ()=>loadTransformers('wasm');
     return;
   }
   const models = findModels();
@@ -289,7 +295,18 @@ async function boot(){
     el('bootBody').innerHTML = `<div class="error-box">Не удалось получить список моделей WebLLM (возможно, нет подключения к сети для первой загрузки библиотеки). Проверьте интернет-соединение и обновите страницу.</div>`;
     return;
   }
+  const webllmCompatible = limits && limits.maxComputeWorkgroupStorageSize >= 32768;
   let chosen = models.find(m=>m.id===store.modelId);
+  if(!webllmCompatible){
+    el('bootBody').innerHTML = `
+      <div class="boot-status">На этом устройстве WebLLM не сможет запуститься: GPU даёт ${limits?.maxComputeWorkgroupStorageSize||0} байт общей памяти вычислительной группы, а текущий runtime WebLLM требует 32768 байт.</div>
+      <div class="boot-note">Это ограничение WebGPU, а не ошибка GitHub Pages. Поэтому SPOOX переключается на другой локальный движок — Transformers.js — без API и без отправки сообщений на сервер.</div>
+      <button class="btn btn-primary" style="margin-top:14px" id="fallbackGpuBtn">Запустить локальный AI</button>
+      <button class="btn" style="margin-top:10px" id="fallbackCpuBtn">Запустить через CPU/WASM (медленнее)</button>`;
+    el('fallbackGpuBtn').onclick = ()=>loadTransformers('webgpu');
+    el('fallbackCpuBtn').onclick = ()=>loadTransformers('wasm');
+    return;
+  }
   if(!chosen){
     el('bootBody').innerHTML = `
       <div class="boot-status">Выберите лёгкую локальную модель для загрузки на устройство:</div>
@@ -333,9 +350,46 @@ async function loadModel(modelId){
     showHero();
     renderHistory();
   }catch(err){
-    el('bootBody').innerHTML = `<div class="error-box">Не удалось загрузить модель: ${esc(err.message||String(err))}.<br><br>Проверьте соединение с интернетом (нужно для первой загрузки весов) и попробуйте снова, либо выберите модель поменьше.</div>
-      <button class="btn" style="margin-top:14px;max-width:200px;" id="retryBtn">Выбрать модель заново</button>`;
-    el('retryBtn').onclick = ()=>{ store.modelId=''; boot(); };
+    localPipeline = null;
+    el('bootBody').innerHTML = `<div class="error-box">WebLLM не запустился: ${esc(err.message||String(err))}</div>
+      <button class="btn btn-primary" style="margin-top:14px" id="fallbackGpuBtn">Попробовать другой локальный движок</button>
+      <button class="btn" style="margin-top:10px" id="fallbackCpuBtn">CPU/WASM</button>`;
+    el('fallbackGpuBtn').onclick = ()=>loadTransformers('webgpu');
+    el('fallbackCpuBtn').onclick = ()=>loadTransformers('wasm');
+  }
+}
+
+async function loadTransformers(device){
+  backendMode = device === 'webgpu' ? 'transformers-webgpu' : 'transformers-wasm';
+  el('bootBody').innerHTML = `
+    <div class="boot-status" id="loadStatus">Подготовка альтернативного локального AI...</div>
+    <div class="progress-wrap"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="progress-pct" id="progressPct">0%</div>
+    <div class="boot-note">Скачивание модели выполняется один раз и кэшируется браузером. API-ключ не нужен.</div>`;
+  try{
+    localPipeline = await pipeline('text-generation', 'HuggingFaceTB/SmolLM2-360M-Instruct', {
+      device,
+      dtype: device === 'webgpu' ? 'q4f16' : 'q8',
+      progress_callback: p => {
+        if(p?.progress != null){
+          const pct=Math.round(p.progress);
+          el('progressBar').style.width=pct+'%';
+          el('progressPct').textContent=pct+'%';
+        }
+        if(p?.status) el('loadStatus').textContent=p.status === 'progress' ? 'Загрузка модели...' : p.status;
+      }
+    });
+    store.modelId = 'SmolLM2-360M-Instruct-local';
+    el('modelPill').textContent = 'Модель: SmolLM2 360M';
+    updateSysInfo();
+    el('newChatBtn').disabled = false;
+    el('bootScreen').style.display='none';
+    showHero();
+    renderHistory();
+  }catch(err){
+    localPipeline = null;
+    el('bootBody').innerHTML = `<div class="error-box">Альтернативный локальный движок тоже не запустился: ${esc(err.message||String(err))}</div><div class="boot-note">Можно попробовать свежий Chrome или режим CPU/WASM. На слабом телефоне CPU-режим может быть очень медленным.</div><button class="btn" style="margin-top:14px;max-width:240px" id="retryBtn">Назад к проверке устройства</button>`;
+    el('retryBtn').onclick=()=>{store.modelId='';location.reload();};
   }
 }
 
@@ -369,8 +423,8 @@ async function updateSysInfo(){
   el('sysInfo').innerHTML = `
     <div><span class="dot ${navigator.gpu?'ok':'bad'}"></span><b>Локальный AI</b> — ответы генерируются на устройстве</div>
     <div><span class="dot ok"></span><b>API не используется</b> — запросы к OpenAI/Anthropic не отправляются</div>
-    <div>Безопасный контекст: <b>${window.isSecureContext?'да':'нет'}</b></div>
     <div>WebGPU: <b>${gpuInfo}</b></div>
+    <div>Движок: <b>${backendMode}</b></div>
     <div>Модель: <b>${store.modelId || '—'}</b></div>
   `;
 }
@@ -466,17 +520,26 @@ async function runGeneration(c){
   const typingEl = appendTyping();
   try{
     const history = c.messages.slice(-16).map(m=>({role:m.role, content:m.content}));
-    const chunks = await engine.chat.completions.create({ messages: history, stream: true, temperature: 0.7 });
     let full = '';
     let bubbleEl = null;
-    for await (const chunk of chunks){
-      if(abortRequested) break;
-      const delta = chunk.choices?.[0]?.delta?.content || '';
-      if(delta){
-        full += delta;
-        if(!bubbleEl){ typingEl.remove(); const w = appendMessage('ai', ''); bubbleEl = w.querySelector('.bubble'); }
-        bubbleEl.innerHTML = marked.parse(full);
-        scrollDown();
+    if(localPipeline){
+      const prompt = localPipeline.tokenizer.apply_chat_template(history, {tokenize:false, add_generation_prompt:true});
+      const output = await localPipeline(prompt, {max_new_tokens:256, temperature:0.7, do_sample:true, return_full_text:false});
+      full = output?.[0]?.generated_text || '';
+      typingEl.remove();
+      const w = appendMessage('ai', full);
+      bubbleEl = w.querySelector('.bubble');
+    } else {
+      const chunks = await engine.chat.completions.create({ messages: history, stream: true, temperature: 0.7 });
+      for await (const chunk of chunks){
+        if(abortRequested) break;
+        const delta = chunk.choices?.[0]?.delta?.content || '';
+        if(delta){
+          full += delta;
+          if(!bubbleEl){ typingEl.remove(); const w = appendMessage('ai', ''); bubbleEl = w.querySelector('.bubble'); }
+          bubbleEl.innerHTML = marked.parse(full);
+          scrollDown();
+        }
       }
     }
     if(abortRequested){ try{ await engine.interruptGenerate(); }catch(e){} }
